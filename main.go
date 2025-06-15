@@ -439,21 +439,31 @@ func (ocr *OCRAnalyzer) isOnlySpecialChars(text string) bool {
 	return !hasLetter && !hasDigit && len(text) > 0
 }
 
-// 반복 패턴 확인
+// 반복 패턴 확인 (Go 호환 버전)
 func (ocr *OCRAnalyzer) isRepeatingPattern(text string) bool {
 	if len(text) < 3 {
 		return false
 	}
 
-	// 같은 문자 반복 (예: "---", "...")
-	if regexp.MustCompile(`^(.)\1{2,}$`).MatchString(text) {
-		return true
+	// 같은 문자 반복 확인 (예: "---", "...", "aaaa")
+	if len(text) >= 3 {
+		firstChar := text[0]
+		allSame := true
+		for _, char := range text {
+			if byte(char) != firstChar {
+				allSame = false
+				break
+			}
+		}
+		if allSame {
+			return true
+		}
 	}
 
-	// 짧은 패턴 반복 (예: "ababab")
+	// 짧은 패턴 반복 (예: "ababab", "123123")
 	for i := 1; i <= len(text)/3; i++ {
 		pattern := text[:i]
-		if strings.Repeat(pattern, len(text)/i) == text {
+		if strings.Repeat(pattern, len(text)/i) == text && len(text) >= i*3 {
 			return true
 		}
 	}
