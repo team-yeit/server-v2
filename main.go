@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type DebugInfo struct {
 	TesseractErrors []string `json:"tesseract_errors,omitempty"`
 	ImageSize       string   `json:"image_size,omitempty"`
 	TessdataPath    string   `json:"tessdata_path,omitempty"`
+	CleanedTexts    int      `json:"cleaned_texts,omitempty"`
 }
 
 // 간소화된 OCR 분석기
@@ -141,32 +143,6 @@ func (ocr *OCRAnalyzer) findAndSetTessdataPath() error {
 		}
 	}
 
-	// 마지막 수단: tesseract 명령어로 경로 확인
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, ocr.tesseractPath, "--print-parameters")
-	output, err := cmd.Output()
-	if err == nil {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "tessdata") {
-				// tessdata 경로 추출 시도
-				parts := strings.Split(line, " ")
-				for _, part := range parts {
-					if strings.Contains(part, "tessdata") && strings.Contains(part, "/") {
-						if _, err := os.Stat(part); err == nil {
-							ocr.tessdataPath = part
-							os.Setenv("TESSDATA_PREFIX", part)
-							log.Printf("✅ Found tessdata via parameters: %s", part)
-							return nil
-						}
-					}
-				}
-			}
-		}
-	}
-
 	return fmt.Errorf("tessdata directory not found in standard locations")
 }
 
@@ -174,7 +150,6 @@ func (ocr *OCRAnalyzer) findAndSetTessdataPath() error {
 func (ocr *OCRAnalyzer) testTesseractConfig() {
 	log.Println("🔧 Testing Tesseract configuration...")
 
-	// 언어 목록 확인으로 설정 테스트
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -182,7 +157,6 @@ func (ocr *OCRAnalyzer) testTesseractConfig() {
 	output, err := cmd.Output()
 	if err != nil {
 		log.Printf("⚠️ Tesseract language list failed: %v", err)
-		// TESSDATA_PREFIX를 다시 설정해보기
 		if ocr.tessdataPath != "" {
 			os.Setenv("TESSDATA_PREFIX", ocr.tessdataPath)
 			log.Printf("🔄 Retrying with TESSDATA_PREFIX=%s", ocr.tessdataPath)
@@ -241,7 +215,7 @@ func (ocr *OCRAnalyzer) getAvailableLanguages() []string {
 	return languages
 }
 
-// 메인 OCR 처리 함수 (경로 문제 해결)
+// 메인 OCR 처리 함수 (텍스트 정리 개선)
 func (ocr *OCRAnalyzer) ExtractTexts(imagePath string) ([]TextElement, *DebugInfo, error) {
 	ocr.mu.RLock()
 	defer ocr.mu.RUnlock()
@@ -274,17 +248,20 @@ func (ocr *OCRAnalyzer) ExtractTexts(imagePath string) ([]TextElement, *DebugInf
 
 	var results []TextElement
 
-	// 방법 1: 전체 이미지 OCR (경로 문제 해결된 버전)
+	// 방법 1: 전체 이미지 OCR
 	fullText := ocr.recognizeFullImageSafe(imagePath, debugInfo)
 	if fullText != "" {
-		centerX := img.Cols() / 2
-		centerY := img.Rows() / 2
-		results = append(results, TextElement{
-			Text: strings.TrimSpace(fullText),
-			X:    centerX,
-			Y:    centerY,
-		})
-		log.Printf("✅ Full image OCR: '%s' at center (%d, %d)", fullText, centerX, centerY)
+		cleanedText := ocr.cleanTesseractOutput(fullText)
+		if cleanedText != "" && ocr.isValidText(cleanedText) {
+			centerX := img.Cols() / 2
+			centerY := img.Rows() / 2
+			results = append(results, TextElement{
+				Text: cleanedText,
+				X:    centerX,
+				Y:    centerY,
+			})
+			log.Printf("✅ Full image OCR (cleaned): '%s' at center (%d, %d)", cleanedText, centerX, centerY)
+		}
 	}
 
 	// 방법 2: 텍스트 영역 감지 후 개별 인식
@@ -295,37 +272,205 @@ func (ocr *OCRAnalyzer) ExtractTexts(imagePath string) ([]TextElement, *DebugInf
 	// 각 영역에서 텍스트 인식 시도
 	for i, region := range textRegions {
 		text := ocr.recognizeTextInRegionSafe(img, region, debugInfo)
-		if text != "" && ocr.isValidText(text) && !ocr.isDuplicateText(text, results) {
+		cleanedText := ocr.cleanTesseractOutput(text)
+
+		if cleanedText != "" && ocr.isValidText(cleanedText) && !ocr.isDuplicateText(cleanedText, results) {
 			results = append(results, TextElement{
-				Text: strings.TrimSpace(text),
+				Text: cleanedText,
 				X:    region.Min.X + region.Dx()/2,
 				Y:    region.Min.Y + region.Dy()/2,
 			})
-			log.Printf("✅ [%d] '%s' at (%d, %d)", i+1, text, region.Min.X+region.Dx()/2, region.Min.Y+region.Dy()/2)
+			log.Printf("✅ [%d] '%s' at (%d, %d)", i+1, cleanedText, region.Min.X+region.Dx()/2, region.Min.Y+region.Dy()/2)
 		}
 	}
 
-	// 중복 제거
+	// 중복 제거 및 정리
 	results = ocr.removeDuplicates(results)
+	results = ocr.filterValidTexts(results)
+
+	debugInfo.CleanedTexts = len(results)
 
 	processingTime := time.Since(startTime)
 	debugInfo.ProcessingTime = processingTime.String()
-	log.Printf("🎯 Extracted %d unique texts in %v", len(results), processingTime)
+	log.Printf("🎯 Extracted %d clean texts in %v", len(results), processingTime)
 
 	return results, debugInfo, nil
+}
+
+// Tesseract 출력 정리 함수
+func (ocr *OCRAnalyzer) cleanTesseractOutput(rawText string) string {
+	if rawText == "" {
+		return ""
+	}
+
+	cleaned := rawText
+
+	// 1. Tesseract 경고 메시지 제거
+	warningPatterns := []string{
+		`Warning: Invalid resolution \d+ dpi\. Using \d+ instead\.`,
+		`Estimating resolution as \d+`,
+		`Warning:.*`,
+		`Error:.*`,
+	}
+
+	for _, pattern := range warningPatterns {
+		re := regexp.MustCompile(pattern)
+		cleaned = re.ReplaceAllString(cleaned, "")
+	}
+
+	// 2. 줄바꿈 정리
+	lines := strings.Split(cleaned, "\n")
+	var validLines []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && len(line) > 0 {
+			validLines = append(validLines, line)
+		}
+	}
+
+	// 3. 최종 텍스트 조합
+	if len(validLines) == 0 {
+		return ""
+	}
+
+	// 짧은 텍스트들은 공백으로 연결, 긴 텍스트는 줄바꿈 유지
+	if len(validLines) == 1 {
+		return validLines[0]
+	}
+
+	// 여러 줄인 경우, 짧은 것들은 합치고 긴 것들은 분리
+	var processedLines []string
+	var currentGroup []string
+
+	for _, line := range validLines {
+		if len(line) <= 10 { // 짧은 텍스트 (기호, 숫자 등)
+			currentGroup = append(currentGroup, line)
+		} else { // 긴 텍스트
+			if len(currentGroup) > 0 {
+				processedLines = append(processedLines, strings.Join(currentGroup, " "))
+				currentGroup = []string{}
+			}
+			processedLines = append(processedLines, line)
+		}
+	}
+
+	// 남은 그룹 처리
+	if len(currentGroup) > 0 {
+		processedLines = append(processedLines, strings.Join(currentGroup, " "))
+	}
+
+	return strings.Join(processedLines, " | ")
+}
+
+// 유효한 텍스트 필터링
+func (ocr *OCRAnalyzer) filterValidTexts(elements []TextElement) []TextElement {
+	var filtered []TextElement
+
+	for _, elem := range elements {
+		text := strings.TrimSpace(elem.Text)
+
+		// 기본 필터링
+		if len(text) < 1 {
+			continue
+		}
+
+		// 너무 짧은 무의미한 텍스트 제거
+		if len(text) <= 2 && !ocr.isSignificantShortText(text) {
+			continue
+		}
+
+		// 특수문자만 있는 텍스트 제거
+		if ocr.isOnlySpecialChars(text) {
+			continue
+		}
+
+		// 반복 패턴 제거
+		if ocr.isRepeatingPattern(text) {
+			continue
+		}
+
+		filtered = append(filtered, elem)
+	}
+
+	return filtered
+}
+
+// 의미있는 짧은 텍스트 판별
+func (ocr *OCRAnalyzer) isSignificantShortText(text string) bool {
+	significantShorts := []string{
+		// 숫자
+		"0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+		// 한글 단어
+		"안", "좋", "나", "다", "를", "을", "의", "에", "로", "과", "와",
+		// 영어 단어
+		"OK", "NO", "ON", "UP", "GO", "IN", "TO", "AT", "BY",
+		// 기호 (의미있는)
+		"@", "#", "$", "%", "&", "*", "+", "-", "=", "?", "!",
+	}
+
+	for _, significant := range significantShorts {
+		if text == significant {
+			return true
+		}
+	}
+
+	// 숫자로만 구성된 경우
+	if regexp.MustCompile(`^\d+$`).MatchString(text) {
+		return true
+	}
+
+	return false
+}
+
+// 특수문자만 있는지 확인
+func (ocr *OCRAnalyzer) isOnlySpecialChars(text string) bool {
+	hasLetter := false
+	hasDigit := false
+
+	for _, r := range text {
+		if unicode.IsLetter(r) {
+			hasLetter = true
+		} else if unicode.IsDigit(r) {
+			hasDigit = true
+		}
+	}
+
+	return !hasLetter && !hasDigit && len(text) > 0
+}
+
+// 반복 패턴 확인
+func (ocr *OCRAnalyzer) isRepeatingPattern(text string) bool {
+	if len(text) < 3 {
+		return false
+	}
+
+	// 같은 문자 반복 (예: "---", "...")
+	if regexp.MustCompile(`^(.)\1{2,}$`).MatchString(text) {
+		return true
+	}
+
+	// 짧은 패턴 반복 (예: "ababab")
+	for i := 1; i <= len(text)/3; i++ {
+		pattern := text[:i]
+		if strings.Repeat(pattern, len(text)/i) == text {
+			return true
+		}
+	}
+
+	return false
 }
 
 // 안전한 전체 이미지 OCR
 func (ocr *OCRAnalyzer) recognizeFullImageSafe(imagePath string, debugInfo *DebugInfo) string {
 	log.Printf("🖼️ Attempting full image OCR...")
 
-	// 간단한 PSM 모드만 시도 (언어 문제 회피)
 	psmModes := []string{"3", "6"}
 
 	for _, psm := range psmModes {
 		text := ocr.runTesseractSafe(imagePath, psm, debugInfo)
 		if text != "" && len(strings.TrimSpace(text)) > 0 {
-			log.Printf("✅ Full image OCR successful with PSM %s: '%s'", psm, text)
+			log.Printf("✅ Full image OCR successful with PSM %s", psm)
 			return text
 		}
 	}
@@ -336,18 +481,15 @@ func (ocr *OCRAnalyzer) recognizeFullImageSafe(imagePath string, debugInfo *Debu
 
 // 안전한 영역별 텍스트 인식
 func (ocr *OCRAnalyzer) recognizeTextInRegionSafe(img gocv.Mat, region image.Rectangle, debugInfo *DebugInfo) string {
-	// ROI 추출
 	roi := img.Region(region)
 	if roi.Empty() {
 		return ""
 	}
 	defer roi.Close()
 
-	// 기본 전처리만 사용
 	processed := ocr.basicPreprocess(roi)
 	defer processed.Close()
 
-	// 임시 파일로 저장
 	tempFile := filepath.Join(os.TempDir(), fmt.Sprintf("ocr_region_%d.png", time.Now().UnixNano()))
 	defer os.Remove(tempFile)
 
@@ -355,31 +497,22 @@ func (ocr *OCRAnalyzer) recognizeTextInRegionSafe(img gocv.Mat, region image.Rec
 		return ""
 	}
 
-	text := ocr.runTesseractSafe(tempFile, "8", debugInfo)
-	if text != "" && ocr.isValidText(text) {
-		log.Printf("✅ Region OCR successful: '%s'", text)
-		return text
-	}
-
-	return ""
+	return ocr.runTesseractSafe(tempFile, "8", debugInfo)
 }
 
-// 안전한 Tesseract 실행 (언어 문제 해결)
+// 안전한 Tesseract 실행
 func (ocr *OCRAnalyzer) runTesseractSafe(imagePath, psm string, debugInfo *DebugInfo) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 환경변수 재설정
 	if ocr.tessdataPath != "" {
 		os.Setenv("TESSDATA_PREFIX", ocr.tessdataPath)
 	}
 
-	// 사용 가능한 언어 확인
 	availableLangs := ocr.getAvailableLanguages()
 
 	var langOptions []string
 
-	// 영어만 사용 (가장 안전)
 	for _, lang := range availableLangs {
 		if lang == "eng" {
 			langOptions = append(langOptions, "eng")
@@ -387,7 +520,6 @@ func (ocr *OCRAnalyzer) runTesseractSafe(imagePath, psm string, debugInfo *Debug
 		}
 	}
 
-	// 한국어 추가 (있는 경우)
 	for _, lang := range availableLangs {
 		if lang == "kor" {
 			if len(langOptions) > 0 {
@@ -399,25 +531,21 @@ func (ocr *OCRAnalyzer) runTesseractSafe(imagePath, psm string, debugInfo *Debug
 		}
 	}
 
-	// 언어 옵션이 없으면 기본값 사용
 	if len(langOptions) == 0 {
 		langOptions = []string{"eng"}
 	}
 
-	// 각 언어 옵션으로 시도
 	for _, langOption := range langOptions {
 		cmd := exec.CommandContext(ctx, ocr.tesseractPath, imagePath, "stdout",
 			"-l", langOption,
 			"--psm", psm)
 
-		// 환경변수 명시적 설정
 		cmd.Env = append(os.Environ(),
 			fmt.Sprintf("TESSDATA_PREFIX=%s", ocr.tessdataPath))
 
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			errorMsg := fmt.Sprintf("Lang %s PSM %s failed: %v, output: %s", langOption, psm, err, string(output))
-			log.Printf("⚠️ %s", errorMsg)
+			errorMsg := fmt.Sprintf("Lang %s PSM %s failed: %v", langOption, psm, err)
 			if debugInfo != nil {
 				debugInfo.TesseractErrors = append(debugInfo.TesseractErrors, errorMsg)
 			}
@@ -426,7 +554,7 @@ func (ocr *OCRAnalyzer) runTesseractSafe(imagePath, psm string, debugInfo *Debug
 
 		result := strings.TrimSpace(string(output))
 		if result != "" {
-			log.Printf("✅ Tesseract successful with lang %s PSM %s: '%s'", langOption, psm, result)
+			log.Printf("✅ Tesseract successful with lang %s PSM %s", langOption, psm)
 			return result
 		}
 	}
@@ -434,18 +562,16 @@ func (ocr *OCRAnalyzer) runTesseractSafe(imagePath, psm string, debugInfo *Debug
 	return ""
 }
 
-// 텍스트 영역 감지 (간소화)
+// 텍스트 영역 감지
 func (ocr *OCRAnalyzer) detectTextRegions(img gocv.Mat) []image.Rectangle {
 	gray := gocv.NewMat()
 	defer gray.Close()
 	gocv.CvtColor(img, &gray, gocv.ColorBGRToGray)
 
-	// 에지 기반 감지만 사용 (가장 효과적)
 	edges := gocv.NewMat()
 	defer edges.Close()
 	gocv.Canny(gray, &edges, 50, 150)
 
-	// 형태학적 연산으로 텍스트 영역 연결
 	kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(10, 2))
 	defer kernel.Close()
 
@@ -461,12 +587,10 @@ func (ocr *OCRAnalyzer) detectTextRegions(img gocv.Mat) []image.Rectangle {
 		contour := contours.At(i)
 		area := gocv.ContourArea(contour)
 
-		// 관대한 필터링
 		if area > 100 && area < 50000 {
 			rect := gocv.BoundingRect(contour)
 
 			if rect.Dx() > 15 && rect.Dy() > 8 && rect.Dy() < 100 {
-				// 패딩 추가
 				padding := 5
 				expandedRect := image.Rect(
 					max(0, rect.Min.X-padding),
@@ -488,13 +612,11 @@ func (ocr *OCRAnalyzer) basicPreprocess(roi gocv.Mat) gocv.Mat {
 	defer gray.Close()
 	gocv.CvtColor(roi, &gray, gocv.ColorBGRToGray)
 
-	// 크기 확대
 	enlarged := gocv.NewMat()
 	defer enlarged.Close()
 	newSize := image.Pt(roi.Cols()*2, roi.Rows()*2)
 	gocv.Resize(gray, &enlarged, newSize, 0, 0, gocv.InterpolationCubic)
 
-	// 적응형 임계값
 	result := gocv.NewMat()
 	gocv.AdaptiveThreshold(enlarged, &result, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 11, 2)
 
@@ -540,7 +662,7 @@ func (ocr *OCRAnalyzer) isValidText(text string) bool {
 	}
 
 	runeCount := len([]rune(trimmed))
-	if runeCount > 100 {
+	if runeCount > 200 { // 더 관대하게
 		return false
 	}
 
@@ -589,7 +711,6 @@ func extractHandler(c *gin.Context) {
 		return
 	}
 
-	// 임시 파일 저장
 	imagePath := filepath.Join(os.TempDir(), fmt.Sprintf("ocr_input_%s.png", requestID))
 	defer os.Remove(imagePath)
 
@@ -602,7 +723,6 @@ func extractHandler(c *gin.Context) {
 		return
 	}
 
-	// OCR 처리
 	texts, debugInfo, err := analyzer.ExtractTexts(imagePath)
 	if err != nil {
 		log.Printf("❌ [%s] OCR failed: %v", requestID, err)
@@ -615,7 +735,7 @@ func extractHandler(c *gin.Context) {
 	}
 
 	processingTime := time.Since(startTime)
-	log.Printf("✅ [%s] Completed in %v - extracted %d texts", requestID, processingTime, len(texts))
+	log.Printf("✅ [%s] Completed in %v - extracted %d clean texts", requestID, processingTime, len(texts))
 
 	showDebug := c.Query("debug") == "true" || analyzer.debugMode
 
@@ -644,7 +764,7 @@ func healthHandler(c *gin.Context) {
 		"status":        status,
 		"timestamp":     time.Now().Unix(),
 		"ocr_enabled":   analyzer != nil && analyzer.enabled,
-		"service_type":  "OCR Text Extraction",
+		"service_type":  "Clean OCR Text Extraction",
 		"debug_mode":    analyzer != nil && analyzer.debugMode,
 		"tessdata_path": "",
 	}
@@ -662,66 +782,62 @@ func healthHandler(c *gin.Context) {
 // 루트 핸들러
 func rootHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"service":     "Fixed OCR Text Extraction Service",
-		"version":     "1.2.0",
-		"description": "Upload image, get text coordinates - Tessdata path issues fixed!",
+		"service":     "Clean OCR Text Extraction Service",
+		"version":     "1.3.0",
+		"description": "Upload image, get clean text coordinates - Warning messages filtered!",
 		"features": []string{
 			"🔵 Advanced OCR text detection and recognition",
 			"🌐 Korean + English support",
 			"📍 Text coordinates extraction",
+			"🧹 Clean output (filtered warnings)",
 			"⚡ Tessdata path auto-detection",
 			"🔧 Debug mode for troubleshooting",
-			"🎯 Robust error handling",
+			"🎯 Smart text filtering",
 		},
 		"usage": map[string]string{
 			"endpoint":   "POST /extract",
 			"input":      "multipart/form-data with 'image' field",
-			"output":     "JSON with text_list: [{text, x, y}, ...]",
+			"output":     "JSON with clean text_list: [{text, x, y}, ...]",
 			"debug_mode": "Add ?debug=true for detailed debug info",
 		},
-		"example": "curl -X POST -F \"image=@screenshot.png\" http://localhost:8000/extract?debug=true",
+		"example": "curl -X POST -F \"image=@screenshot.png\" http://localhost:8000/extract",
 	})
 }
 
 func main() {
-	log.Println("🚀 Starting Fixed OCR Text Extraction Service...")
+	log.Println("🚀 Starting Clean OCR Text Extraction Service...")
 
-	// OCR 분석기 초기화
 	var err error
 	analyzer, err = NewOCRAnalyzer()
 	if err != nil {
 		log.Fatalf("❌ Failed to initialize OCR: %v", err)
 	}
 
-	// Gin 설정
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
 
-	// CORS 설정
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
 	config.AllowMethods = []string{"GET", "POST", "OPTIONS"}
 	config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type"}
 	r.Use(cors.New(config))
 
-	// 라우트 설정
 	r.GET("/", rootHandler)
 	r.GET("/health", healthHandler)
 	r.POST("/extract", extractHandler)
 
-	// 포트 설정
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
 	}
 
-	log.Printf("✅ Fixed OCR Service ready on port %s", port)
+	log.Printf("✅ Clean OCR Service ready on port %s", port)
 	log.Printf("🔵 Tesseract enabled: %t", analyzer.enabled)
 	log.Printf("📁 Tessdata path: %s", analyzer.tessdataPath)
 	log.Printf("🌐 Languages: Korean + English")
-	log.Printf("🔧 Debug mode: %t", analyzer.debugMode)
+	log.Printf("🧹 Clean output: Warning messages filtered")
 	log.Printf("📋 Usage: POST /extract with image file")
 
 	if err := r.Run(":" + port); err != nil {
