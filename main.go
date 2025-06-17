@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"log"
@@ -32,6 +34,34 @@ type OCRResponse struct {
 	TextList   []TextElement `json:"text_list"`
 	TotalCount int           `json:"total_count"`
 	Message    string        `json:"message,omitempty"`
+}
+
+type TextExtractRequest struct {
+	Text string `json:"text" binding:"required"`
+}
+
+type TextExtractResponse struct {
+	Result string `json:"result"`
+}
+
+type OpenAIRequest struct {
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Temperature float64   `json:"temperature"`
+	MaxTokens   int       `json:"max_tokens"`
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIResponse struct {
+	Choices []Choice `json:"choices"`
+}
+
+type Choice struct {
+	Message Message `json:"message"`
 }
 
 type OCRAnalyzer struct {
@@ -480,12 +510,289 @@ func (ocr *OCRAnalyzer) isValidText(text string) bool {
 	return hasValidChar
 }
 
+func callOpenAI(prompt string) (string, error) {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENAI_API_KEY environment variable not set")
+	}
+
+	requestBody := OpenAIRequest{
+		Model:       "gpt-4o-mini",
+		Temperature: 0.1,
+		MaxTokens:   150,
+		Messages: []Message{
+			{
+				Role:    "system",
+				Content: "You are a precise text extraction specialist. Follow instructions exactly. Return only the requested information without explanations, formatting, or additional text.",
+			},
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var openAIResp OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&openAIResp); err != nil {
+		return "", err
+	}
+
+	if len(openAIResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from OpenAI")
+	}
+
+	return strings.TrimSpace(openAIResp.Choices[0].Message.Content), nil
+}
+
+func extractStoreNameFromText(text string) (string, error) {
+	prompt := fmt.Sprintf(`TASK: Extract the exact store/restaurant name from stuttered speech.
+
+CONTEXT: Users often stutter when saying store names. Your job is to identify the core business name, removing filler words and repetitions.
+
+RULES:
+1. Extract ONLY the main store/brand name
+2. Remove stutters, filler words (어, 아, 그, 음, 잠깐만, 뭐지, 등)
+3. If multiple versions of same name appear, choose the shortest complete form
+4. Return Korean store names in Korean, English names in English
+5. Do not add quotes, punctuation, or explanations
+6. If no clear store name exists, return "NONE"
+
+EXAMPLES:
+Input: "아 그 교촌 어 교촌치킨"
+Output: 교촌
+
+Input: "어어 아 어 할머니보쌈"
+Output: 할머니보쌈
+
+Input: "맥도... 맥도날... 맥도날드"
+Output: 맥도날드
+
+Input: "버거킹 어 버거 버거킹 햄버거"
+Output: 버거킹
+
+Input: "스타 스타벅스 커피"
+Output: 스타벅스
+
+Input: "그냥 배고파"
+Output: NONE
+
+INPUT TEXT: "%s"
+OUTPUT:`, text)
+
+	return callOpenAI(prompt)
+}
+
+func extractNumberFromText(text string) (string, error) {
+	prompt := fmt.Sprintf(`TASK: Extract the specific number mentioned in stuttered speech.
+
+CONTEXT: Users stutter when trying to say numbers. Extract the exact number they're attempting to communicate.
+
+RULES:
+1. Extract ONLY the number (digits)
+2. Remove all filler words (아, 그, 어, 잠깐만, 번, 호, 등)
+3. If same number repeated multiple times, return it once
+4. Return only Arabic numerals (1, 2, 3, not 일, 이, 삼)
+5. No decimal points unless clearly specified
+6. If no number found, return "NONE"
+
+EXAMPLES:
+Input: "아 그 잠깐만 4번 어 4번"
+Output: 4
+
+Input: "5호 어 5 5호점"
+Output: 5
+
+Input: "이십 어 20 스무개"
+Output: 20
+
+Input: "한 하나 1개"
+Output: 1
+
+Input: "그냥 많이"
+Output: NONE
+
+INPUT TEXT: "%s"
+OUTPUT:`, text)
+
+	return callOpenAI(prompt)
+}
+
+func extractFoodNameFromText(text string) (string, error) {
+	prompt := fmt.Sprintf(`TASK: Extract the exact food/menu item name from stuttered speech.
+
+CONTEXT: Users stutter when ordering food. Extract the specific food/menu item they want to order.
+
+RULES:
+1. Extract ONLY the main food/menu item name
+2. Remove stutters, filler words (어, 아, 그, 음, 잠깐만)
+3. Keep food-specific terms (치킨, 피자, 버거, 라면, etc.)
+4. If multiple versions of same food appear, choose the most complete form
+5. Return Korean food names in Korean, English names in English
+6. Do not include quantities, sizes, or modifiers unless part of the official name
+7. If no clear food name exists, return "NONE"
+
+EXAMPLES:
+Input: "어 그 뿌링클 어 치킨"
+Output: 뿌링클
+
+Input: "불고기 어 불고기버거"
+Output: 불고기버거
+
+Input: "아 짜장 짜장면"
+Output: 짜장면
+
+Input: "핫윙 어 핫 핫윙스"
+Output: 핫윙
+
+Input: "그냥 배고파"
+Output: NONE
+
+INPUT TEXT: "%s"
+OUTPUT:`, text)
+
+	return callOpenAI(prompt)
+}
+
+func filterStoreNames(textList []TextElement) ([]TextElement, error) {
+	if len(textList) == 0 {
+		return []TextElement{}, nil
+	}
+
+	var allTexts []string
+	for _, item := range textList {
+		allTexts = append(allTexts, fmt.Sprintf("\"%s\"", item.Text))
+	}
+
+	prompt := fmt.Sprintf(`TASK: Identify store/restaurant names from OCR text results.
+
+CONTEXT: This is text extracted from images (signs, menus, etc.). Filter out everything except actual business names.
+
+TEXT LIST: [%s]
+
+RULES:
+1. Identify text that represents store/restaurant/business names
+2. Exclude: prices, menu descriptions, addresses, phone numbers, hours, promotional text
+3. Include: brand names, restaurant names, store names, franchise names
+4. Return results as comma-separated values
+5. Keep original text exactly as provided
+6. If no store names found, return "NONE"
+
+EXAMPLES:
+Input: ["맥도날드", "빅맥 세트", "5,500원", "영업시간", "02-123-4567"]
+Output: 맥도날드
+
+Input: ["스타벅스", "아메리카노", "4,500원", "카페라떼", "매장안내"]
+Output: 스타벅스
+
+Input: ["BBQ", "황금올리브치킨", "반반치킨", "17,000원", "배달가능"]
+Output: BBQ
+
+OUTPUT:`, strings.Join(allTexts, ", "))
+
+	result, err := callOpenAI(prompt)
+	if err != nil {
+		return nil, err
+	}
+
+	return filterTextItems(textList, result), nil
+}
+
+func filterFoodNames(textList []TextElement) ([]TextElement, error) {
+	if len(textList) == 0 {
+		return []TextElement{}, nil
+	}
+
+	var allTexts []string
+	for _, item := range textList {
+		allTexts = append(allTexts, fmt.Sprintf("\"%s\"", item.Text))
+	}
+
+	prompt := fmt.Sprintf(`TASK: Identify food/menu item names from OCR text results.
+
+CONTEXT: This is text extracted from menu images. Filter out everything except actual food/menu items.
+
+TEXT LIST: [%s]
+
+RULES:
+1. Identify text that represents food items, dishes, beverages, menu items
+2. Exclude: prices, store names, addresses, promotional text, descriptions, categories
+3. Include: specific food names, drink names, dish names, menu items
+4. Return results as comma-separated values
+5. Keep original text exactly as provided
+6. If no food names found, return "NONE"
+
+EXAMPLES:
+Input: ["맥도날드", "빅맥 세트", "5,500원", "치즈버거", "콜라"]
+Output: 빅맥 세트, 치즈버거, 콜라
+
+Input: ["스타벅스", "아메리카노", "4,500원", "카페라떼", "매장안내"]
+Output: 아메리카노, 카페라떼
+
+Input: ["BBQ", "황금올리브치킨", "반반치킨", "17,000원", "배달가능"]
+Output: 황금올리브치킨, 반반치킨
+
+OUTPUT:`, strings.Join(allTexts, ", "))
+
+	result, err := callOpenAI(prompt)
+	if err != nil {
+		return nil, err
+	}
+
+	return filterTextItems(textList, result), nil
+}
+
+func filterTextItems(originalItems []TextElement, filteredTexts string) []TextElement {
+	if filteredTexts == "NONE" || strings.TrimSpace(filteredTexts) == "" {
+		return []TextElement{}
+	}
+
+	var result []TextElement
+	filteredList := strings.Split(filteredTexts, ",")
+
+	for _, filteredText := range filteredList {
+		cleanText := strings.TrimSpace(filteredText)
+		cleanText = strings.Trim(cleanText, "\"'")
+
+		for _, item := range originalItems {
+			if strings.Contains(strings.ToLower(item.Text), strings.ToLower(cleanText)) ||
+				strings.Contains(strings.ToLower(cleanText), strings.ToLower(item.Text)) ||
+				strings.EqualFold(item.Text, cleanText) {
+				result = append(result, item)
+				break
+			}
+		}
+	}
+
+	return result
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
 	}
 	return b
 }
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -495,11 +802,23 @@ func min(a, b int) int {
 
 var analyzer *OCRAnalyzer
 
-func extractHandler(c *gin.Context) {
+func imageExtractHandler(c *gin.Context) {
 	requestStart := time.Now()
 	clientIP := c.ClientIP()
 	userAgent := c.GetHeader("User-Agent")
 	log.Printf("[HTTP REQUEST] OCR extraction request received from client IP: %s, User-Agent: %s, timestamp: %v", clientIP, userAgent, requestStart)
+
+	filterType := c.Query("type")
+	log.Printf("[HTTP REQUEST] Filter type: '%s'", filterType)
+
+	if filterType != "" && filterType != "store" && filterType != "food" {
+		log.Printf("[HTTP REQUEST ERROR] Invalid filter type: %s", filterType)
+		c.JSON(http.StatusBadRequest, OCRResponse{
+			Success: false,
+			Message: "type parameter must be 'store' or 'food'",
+		})
+		return
+	}
 
 	file, err := c.FormFile("image")
 	if err != nil {
@@ -528,14 +847,91 @@ func extractHandler(c *gin.Context) {
 		return
 	}
 
-	requestDuration := time.Since(requestStart)
-	response := OCRResponse{Success: true, TextList: texts, TotalCount: len(texts)}
+	var finalTexts []TextElement
+	if filterType == "" {
+		finalTexts = texts
+		log.Printf("[HTTP REQUEST] No filtering applied, returning %d text elements", len(finalTexts))
+	} else {
+		switch filterType {
+		case "store":
+			finalTexts, err = filterStoreNames(texts)
+			if err != nil {
+				log.Printf("[HTTP REQUEST ERROR] Store name filtering failed: %v", err)
+				c.JSON(http.StatusInternalServerError, OCRResponse{Success: false, Message: "Store name filtering failed"})
+				return
+			}
+			log.Printf("[HTTP REQUEST] Store name filtering applied, %d elements filtered from %d", len(finalTexts), len(texts))
+		case "food":
+			finalTexts, err = filterFoodNames(texts)
+			if err != nil {
+				log.Printf("[HTTP REQUEST ERROR] Food name filtering failed: %v", err)
+				c.JSON(http.StatusInternalServerError, OCRResponse{Success: false, Message: "Food name filtering failed"})
+				return
+			}
+			log.Printf("[HTTP REQUEST] Food name filtering applied, %d elements filtered from %d", len(finalTexts), len(texts))
+		}
+	}
 
-	log.Printf("[HTTP REQUEST SUCCESS] OCR extraction completed successfully in %v, client IP: %s, extracted %d text elements", requestDuration, clientIP, len(texts))
-	for i, text := range texts {
+	requestDuration := time.Since(requestStart)
+	response := OCRResponse{Success: true, TextList: finalTexts, TotalCount: len(finalTexts)}
+
+	log.Printf("[HTTP REQUEST SUCCESS] OCR extraction completed successfully in %v, client IP: %s, extracted %d text elements", requestDuration, clientIP, len(finalTexts))
+	for i, text := range finalTexts {
 		log.Printf("[HTTP REQUEST SUCCESS] Text element %d: '%s' at position (%d, %d)", i+1, text.Text, text.X, text.Y)
 	}
 
+	c.JSON(http.StatusOK, response)
+}
+
+func textExtractHandler(c *gin.Context) {
+	requestStart := time.Now()
+	clientIP := c.ClientIP()
+	log.Printf("[HTTP TEXT REQUEST] Text extraction request received from client IP: %s", clientIP)
+
+	extractType := c.Query("type")
+	if extractType == "" {
+		log.Printf("[HTTP TEXT REQUEST ERROR] Missing type parameter")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type query parameter is required"})
+		return
+	}
+
+	if extractType != "store" && extractType != "number" && extractType != "food" {
+		log.Printf("[HTTP TEXT REQUEST ERROR] Invalid type: %s", extractType)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be 'store', 'number', or 'food'"})
+		return
+	}
+
+	var req TextExtractRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[HTTP TEXT REQUEST ERROR] JSON binding failed: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[HTTP TEXT REQUEST] Processing text: '%s', type: %s", req.Text, extractType)
+
+	var result string
+	var err error
+
+	switch extractType {
+	case "store":
+		result, err = extractStoreNameFromText(req.Text)
+	case "number":
+		result, err = extractNumberFromText(req.Text)
+	case "food":
+		result, err = extractFoodNameFromText(req.Text)
+	}
+
+	if err != nil {
+		log.Printf("[HTTP TEXT REQUEST ERROR] Text extraction failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	requestDuration := time.Since(requestStart)
+	response := TextExtractResponse{Result: result}
+
+	log.Printf("[HTTP TEXT REQUEST SUCCESS] Text extraction completed in %v, client IP: %s, result: '%s'", requestDuration, clientIP, result)
 	c.JSON(http.StatusOK, response)
 }
 
@@ -565,7 +961,8 @@ func main() {
 	config.AllowAllOrigins = true
 	r.Use(cors.New(config))
 
-	r.POST("/extract", extractHandler)
+	r.POST("/image/extract", imageExtractHandler)
+	r.POST("/text/extract", textExtractHandler)
 	r.GET("/health", healthHandler)
 
 	port := os.Getenv("PORT")
@@ -574,7 +971,10 @@ func main() {
 	}
 
 	log.Printf("[APPLICATION START] OCR service ready to accept requests on port %s, analyzer enabled: %t, tesseract path: %s", port, analyzer.enabled, analyzer.tesseractPath)
-	log.Printf("[APPLICATION START] Available endpoints: POST /extract (OCR processing), GET /health (service status)")
+	log.Printf("[APPLICATION START] Available endpoints:")
+	log.Printf("[APPLICATION START] - POST /image/extract (OCR processing, optional ?type=store or ?type=food)")
+	log.Printf("[APPLICATION START] - POST /text/extract?type=store|number|food (Text processing)")
+	log.Printf("[APPLICATION START] - GET /health (service status)")
 	log.Printf("[APPLICATION START] CORS enabled for all origins, request timeout: 15 seconds")
 
 	if err := r.Run(":" + port); err != nil {
