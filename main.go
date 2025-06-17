@@ -683,38 +683,25 @@ func filterStoreNames(textList []TextElement) ([]TextElement, error) {
 		allTexts = append(allTexts, fmt.Sprintf("\"%s\"", item.Text))
 	}
 
-	prompt := fmt.Sprintf(`TASK: Identify store/restaurant names from OCR text results.
+	prompt := fmt.Sprintf(`다음은 OCR로 추출된 텍스트들입니다. 이 중에서 가게이름/브랜드명에 해당하는 것들만 정확히 식별해주세요.
 
-CONTEXT: This is text extracted from images (signs, menus, etc.). Filter out everything except actual business names.
+규칙:
+1. 가게이름/브랜드명만 선택하세요 (예: 맥도날드, 스타벅스, BBQ, 교촌치킨 등)
+2. 메뉴명, 가격, 기타 정보는 제외하세요
+3. 복합 텍스트에서 가게이름 부분만 추출하세요
+4. 결과는 쉼표로 구분해서 반환하세요
+5. 가게이름이 없으면 "NONE"을 반환하세요
 
-TEXT LIST: [%s]
+텍스트 목록: [%s]
 
-RULES:
-1. Identify text that represents store/restaurant/business names
-2. Exclude: prices, menu descriptions, addresses, phone numbers, hours, promotional text
-3. Include: brand names, restaurant names, store names, franchise names
-4. Return results as comma-separated values
-5. Keep original text exactly as provided
-6. If no store names found, return "NONE"
-
-EXAMPLES:
-Input: ["맥도날드", "빅맥 세트", "5,500원", "영업시간", "02-123-4567"]
-Output: 맥도날드
-
-Input: ["스타벅스", "아메리카노", "4,500원", "카페라떼", "매장안내"]
-Output: 스타벅스
-
-Input: ["BBQ", "황금올리브치킨", "반반치킨", "17,000원", "배달가능"]
-Output: BBQ
-
-OUTPUT:`, strings.Join(allTexts, ", "))
+가게이름만 추출:`, strings.Join(allTexts, ", "))
 
 	result, err := callOpenAI(prompt)
 	if err != nil {
 		return nil, err
 	}
 
-	return filterTextItems(textList, result), nil
+	return filterTextItemsImproved(textList, result), nil
 }
 
 func filterFoodNames(textList []TextElement) ([]TextElement, error) {
@@ -727,38 +714,25 @@ func filterFoodNames(textList []TextElement) ([]TextElement, error) {
 		allTexts = append(allTexts, fmt.Sprintf("\"%s\"", item.Text))
 	}
 
-	prompt := fmt.Sprintf(`TASK: Identify food/menu item names from OCR text results.
+	prompt := fmt.Sprintf(`다음은 OCR로 추출된 텍스트들입니다. 이 중에서 음식명/메뉴명에 해당하는 것들만 정확히 식별해주세요.
 
-CONTEXT: This is text extracted from menu images. Filter out everything except actual food/menu items.
+규칙:
+1. 음식명/메뉴명만 선택하세요 (예: 빅맥세트, 치즈버거, 아메리카노, 뿌링클 등)
+2. 가게이름, 가격, 기타 정보는 제외하세요
+3. 복합 텍스트에서 음식명 부분만 추출하세요
+4. 결과는 쉼표로 구분해서 반환하세요
+5. 음식명이 없으면 "NONE"을 반환하세요
 
-TEXT LIST: [%s]
+텍스트 목록: [%s]
 
-RULES:
-1. Identify text that represents food items, dishes, beverages, menu items
-2. Exclude: prices, store names, addresses, promotional text, descriptions, categories
-3. Include: specific food names, drink names, dish names, menu items
-4. Return results as comma-separated values
-5. Keep original text exactly as provided
-6. If no food names found, return "NONE"
-
-EXAMPLES:
-Input: ["맥도날드", "빅맥 세트", "5,500원", "치즈버거", "콜라"]
-Output: 빅맥 세트, 치즈버거, 콜라
-
-Input: ["스타벅스", "아메리카노", "4,500원", "카페라떼", "매장안내"]
-Output: 아메리카노, 카페라떼
-
-Input: ["BBQ", "황금올리브치킨", "반반치킨", "17,000원", "배달가능"]
-Output: 황금올리브치킨, 반반치킨
-
-OUTPUT:`, strings.Join(allTexts, ", "))
+음식명만 추출:`, strings.Join(allTexts, ", "))
 
 	result, err := callOpenAI(prompt)
 	if err != nil {
 		return nil, err
 	}
 
-	return filterTextItems(textList, result), nil
+	return filterTextItemsImproved(textList, result), nil
 }
 
 func filterTextItems(originalItems []TextElement, filteredTexts string) []TextElement {
@@ -784,6 +758,67 @@ func filterTextItems(originalItems []TextElement, filteredTexts string) []TextEl
 	}
 
 	return result
+}
+
+func filterTextItemsImproved(originalItems []TextElement, filteredTexts string) []TextElement {
+	if filteredTexts == "NONE" || strings.TrimSpace(filteredTexts) == "" {
+		return []TextElement{}
+	}
+
+	var result []TextElement
+	seen := make(map[string]bool)
+
+	filteredList := strings.Split(filteredTexts, ",")
+
+	for _, filteredText := range filteredList {
+		cleanText := strings.TrimSpace(filteredText)
+		cleanText = strings.Trim(cleanText, "\"'")
+
+		if cleanText == "" || seen[cleanText] {
+			continue
+		}
+
+		for _, item := range originalItems {
+			itemText := strings.TrimSpace(item.Text)
+
+			if strings.EqualFold(itemText, cleanText) {
+				result = append(result, TextElement{
+					Text: cleanText,
+					X:    item.X,
+					Y:    item.Y,
+				})
+				seen[cleanText] = true
+				break
+			}
+
+			if strings.Contains(strings.ToLower(itemText), strings.ToLower(cleanText)) {
+				if isWordMatch(itemText, cleanText) {
+					result = append(result, TextElement{
+						Text: cleanText,
+						X:    item.X,
+						Y:    item.Y,
+					})
+					seen[cleanText] = true
+					break
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func isWordMatch(fullText, targetWord string) bool {
+	fullLower := strings.ToLower(fullText)
+	targetLower := strings.ToLower(targetWord)
+
+	pattern := fmt.Sprintf(`\b%s\b`, regexp.QuoteMeta(targetLower))
+	matched, err := regexp.MatchString(pattern, fullLower)
+	if err != nil {
+		return strings.Contains(fullLower, targetLower)
+	}
+
+	return matched
 }
 
 func max(a, b int) int {
