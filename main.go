@@ -523,7 +523,7 @@ func callOpenAI(prompt string) (string, error) {
 		Messages: []Message{
 			{
 				Role:    "system",
-				Content: "You are a precise text extraction specialist. Follow instructions exactly. Return only the requested information without explanations, formatting, or additional text.",
+				Content: "You are a precise OCR text analysis specialist with expertise in Korean text recognition errors. Follow instructions exactly. Return only the requested information without explanations, formatting, or additional text. Handle OCR recognition errors intelligently.",
 			},
 			{
 				Role:    "user",
@@ -683,25 +683,47 @@ func filterStoreNames(textList []TextElement) ([]TextElement, error) {
 		allTexts = append(allTexts, fmt.Sprintf("\"%s\"", item.Text))
 	}
 
-	prompt := fmt.Sprintf(`다음은 OCR로 추출된 텍스트들입니다. 이 중에서 가게이름/브랜드명에 해당하는 것들만 정확히 식별해주세요.
+	prompt := fmt.Sprintf(`TASK: Identify store/restaurant names from OCR text results with error correction.
 
-규칙:
-1. 가게이름/브랜드명만 선택하세요 (예: 맥도날드, 스타벅스, BBQ, 교촌치킨 등)
-2. 메뉴명, 가격, 기타 정보는 제외하세요
-3. 복합 텍스트에서 가게이름 부분만 추출하세요
-4. 결과는 쉼표로 구분해서 반환하세요
-5. 가게이름이 없으면 "NONE"을 반환하세요
+CONTEXT: This is text extracted from images (signs, menus, etc.) using OCR technology. OCR often makes recognition errors, especially with Korean text.
 
-텍스트 목록: [%s]
+TEXT LIST: [%s]
 
-가게이름만 추출:`, strings.Join(allTexts, ", "))
+RULES:
+1. Identify text that represents store/restaurant/business names
+2. Handle OCR recognition errors intelligently and provide corrected names
+3. Exclude: prices, menu descriptions, addresses, phone numbers, hours, promotional text
+4. Include: brand names, restaurant names, store names, franchise names
+5. Return results as comma-separated values with corrected spelling
+6. Keep original meaning but fix OCR errors
+7. If no store names found, return "NONE"
+
+OCR ERROR CORRECTION EXAMPLES:
+- "맥도냘드" → "맥도날드"
+- "스따벅스" → "스타벅스"
+- "버거킹" → "버거킹"
+- "교촌지킨" → "교촌치킨"
+- "BBQ" → "BBQ"
+- "롯떼리아" → "롯데리아"
+
+ANALYSIS EXAMPLES:
+Input: ["맥도날드", "빅맥세트", "5,500원", "영업시간", "02-123-4567"]
+Output: 맥도날드
+
+Input: ["스따벅스", "아메리카노", "4,500원", "카페라떼", "매장안내"]  
+Output: 스타벅스
+
+Input: ["BBQ", "황금올리브치킨", "반반치킨", "17,000원", "배달가능"]
+Output: BBQ
+
+OUTPUT:`, strings.Join(allTexts, ", "))
 
 	result, err := callOpenAI(prompt)
 	if err != nil {
 		return nil, err
 	}
 
-	return filterTextItemsImproved(textList, result), nil
+	return filterTextItemsAdvanced(textList, result), nil
 }
 
 func filterFoodNames(textList []TextElement) ([]TextElement, error) {
@@ -714,25 +736,48 @@ func filterFoodNames(textList []TextElement) ([]TextElement, error) {
 		allTexts = append(allTexts, fmt.Sprintf("\"%s\"", item.Text))
 	}
 
-	prompt := fmt.Sprintf(`다음은 OCR로 추출된 텍스트들입니다. 이 중에서 음식명/메뉴명에 해당하는 것들만 정확히 식별해주세요.
+	prompt := fmt.Sprintf(`TASK: Identify food/menu item names from OCR text results with error correction.
 
-규칙:
-1. 음식명/메뉴명만 선택하세요 (예: 빅맥세트, 치즈버거, 아메리카노, 뿌링클 등)
-2. 가게이름, 가격, 기타 정보는 제외하세요
-3. 복합 텍스트에서 음식명 부분만 추출하세요
-4. 결과는 쉼표로 구분해서 반환하세요
-5. 음식명이 없으면 "NONE"을 반환하세요
+CONTEXT: This is text extracted from menu images using OCR technology. OCR often makes recognition errors, especially with Korean food names.
 
-텍스트 목록: [%s]
+TEXT LIST: [%s]
 
-음식명만 추출:`, strings.Join(allTexts, ", "))
+RULES:
+1. Identify text that represents food items, dishes, beverages, menu items
+2. Handle OCR recognition errors intelligently and provide corrected names
+3. Exclude: store names, prices, promotional text, descriptions, categories
+4. Include: specific food names, drink names, dish names, menu items
+5. Return results as comma-separated values with corrected spelling
+6. Keep original meaning but fix OCR errors
+7. If no food names found, return "NONE"
+
+OCR ERROR CORRECTION EXAMPLES:
+- "비맥세트" → "빅맥세트"
+- "지즈버거" → "치즈버거"
+- "아메리가노" → "아메리카노"
+- "불고기버거" → "불고기버거"
+- "뿌링끌" → "뿌링클"
+- "콜라" → "콜라"
+- "화이트모까" → "화이트모카"
+
+ANALYSIS EXAMPLES:
+Input: ["맥도날드", "비맥세트", "5,500원", "지즈버거", "콜라"]
+Output: 빅맥세트, 치즈버거, 콜라
+
+Input: ["스타벅스", "아메리가노", "4,500원", "까페라떼", "매장안내"]
+Output: 아메리카노, 카페라떼
+
+Input: ["BBQ", "황금올리브치킨", "뿌링끌", "17,000원", "배달가능"]
+Output: 황금올리브치킨, 뿌링클
+
+OUTPUT:`, strings.Join(allTexts, ", "))
 
 	result, err := callOpenAI(prompt)
 	if err != nil {
 		return nil, err
 	}
 
-	return filterTextItemsImproved(textList, result), nil
+	return filterTextItemsAdvanced(textList, result), nil
 }
 
 func filterTextItems(originalItems []TextElement, filteredTexts string) []TextElement {
@@ -792,7 +837,7 @@ func filterTextItemsImproved(originalItems []TextElement, filteredTexts string) 
 			}
 
 			if strings.Contains(strings.ToLower(itemText), strings.ToLower(cleanText)) {
-				if isWordMatch(itemText, cleanText) {
+				if isWordBoundaryMatch(cleanText, itemText) {
 					result = append(result, TextElement{
 						Text: cleanText,
 						X:    item.X,
@@ -808,31 +853,151 @@ func filterTextItemsImproved(originalItems []TextElement, filteredTexts string) 
 	return result
 }
 
-func isWordMatch(fullText, targetWord string) bool {
-	fullLower := strings.ToLower(fullText)
-	targetLower := strings.ToLower(targetWord)
-
-	pattern := fmt.Sprintf(`\b%s\b`, regexp.QuoteMeta(targetLower))
-	matched, err := regexp.MatchString(pattern, fullLower)
-	if err != nil {
-		return strings.Contains(fullLower, targetLower)
+func filterTextItemsAdvanced(originalItems []TextElement, filteredTexts string) []TextElement {
+	if filteredTexts == "NONE" || strings.TrimSpace(filteredTexts) == "" {
+		return []TextElement{}
 	}
 
-	return matched
+	var result []TextElement
+	seen := make(map[string]bool)
+
+	filteredList := strings.Split(filteredTexts, ",")
+
+	for _, filteredText := range filteredList {
+		cleanText := strings.TrimSpace(filteredText)
+		cleanText = strings.Trim(cleanText, "\"'")
+
+		if cleanText == "" || seen[cleanText] {
+			continue
+		}
+
+		bestMatch := findBestMatchAdvanced(cleanText, originalItems)
+		if bestMatch != nil {
+			result = append(result, TextElement{
+				Text: cleanText,
+				X:    bestMatch.X,
+				Y:    bestMatch.Y,
+			})
+			seen[cleanText] = true
+		}
+	}
+
+	return result
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
+func findBestMatchAdvanced(targetText string, items []TextElement) *TextElement {
+	var bestMatch *TextElement
+	maxScore := 0.0
+
+	targetLower := strings.ToLower(targetText)
+
+	for _, item := range items {
+		itemLower := strings.ToLower(item.Text)
+		score := calculateMatchScore(targetLower, itemLower)
+
+		if score > maxScore && score > 0.3 {
+			maxScore = score
+			bestMatch = &item
+		}
 	}
-	return b
+
+	return bestMatch
 }
 
-func min(a, b int) int {
-	if a < b {
+func calculateMatchScore(target, source string) float64 {
+	if target == source {
+		return 1.0
+	}
+
+	if strings.Contains(source, target) || strings.Contains(target, source) {
+		return 0.9
+	}
+
+	if isWordBoundaryMatch(target, source) {
+		return 0.85
+	}
+
+	similarity := calculateTextSimilarity(target, source)
+
+	lengthRatio := float64(min(len(target), len(source))) / float64(max(len(target), len(source)))
+
+	return similarity * lengthRatio
+}
+
+func isWordBoundaryMatch(target, source string) bool {
+	sourceWords := strings.FieldsFunc(source, func(c rune) bool {
+		return c == ' ' || c == '|' || c == '-' || c == ',' || c == '.'
+	})
+
+	for _, word := range sourceWords {
+		word = strings.TrimSpace(word)
+		if strings.EqualFold(word, target) {
+			return true
+		}
+		if calculateTextSimilarity(strings.ToLower(word), strings.ToLower(target)) > 0.8 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func calculateTextSimilarity(str1, str2 string) float64 {
+	if str1 == str2 {
+		return 1.0
+	}
+
+	if len(str1) == 0 || len(str2) == 0 {
+		return 0.0
+	}
+
+	distance := levenshteinDistance(str1, str2)
+	maxLen := max(len(str1), len(str2))
+
+	return 1.0 - (float64(distance) / float64(maxLen))
+}
+
+func levenshteinDistance(str1, str2 string) int {
+	m, n := len(str1), len(str2)
+
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+
+	for i := 0; i <= m; i++ {
+		dp[i][0] = i
+	}
+	for j := 0; j <= n; j++ {
+		dp[0][j] = j
+	}
+
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			cost := 0
+			if str1[i-1] != str2[j-1] {
+				cost = 1
+			}
+
+			dp[i][j] = min3(
+				dp[i-1][j]+1,
+				dp[i][j-1]+1,
+				dp[i-1][j-1]+cost,
+			)
+		}
+	}
+
+	return dp[m][n]
+}
+
+func min3(a, b, c int) int {
+	if a < b && a < c {
 		return a
 	}
-	return b
+	if b < c {
+		return b
+	}
+	return c
 }
 
 var analyzer *OCRAnalyzer
